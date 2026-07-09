@@ -70,13 +70,15 @@ from playwright.sync_api import sync_playwright
 
 # ----------------------------- CONFIG -------------------------------
 
-EVENT_URL = "https://compass.onpeak.com/e/012607077/3#hotels"
+EVENT_URL = "https://compass.onpeak.com/e/012607077/5#hotels"
 
-# Text to look for. Keep these loose (lowercase, partial) since the
-# page may render "Anaheim Marriott" vs "Marriott Anaheim" etc.
+# Exact card titles as they render on the page (case-insensitive match).
+# Use the FULL exact title -- e.g. "Anaheim Marriott Hotel", not just
+# "Anaheim Marriott" -- so we don't accidentally match a different
+# nearby property like "Anaheim Marriott Suites".
 WATCHED_HOTELS = [
-    "hilton anaheim",
-    "anaheim marriott",
+    "Hilton Anaheim",
+    "Anaheim Marriott Hotel",
 ]
 
 # Keywords that indicate NO availability. If a hotel's card contains
@@ -94,11 +96,6 @@ JITTER_SECONDS = 5 * 60                    # +/- up to 5 min, to avoid a
 STATE_FILE = "hotel_watcher_state.txt"     # remembers last known status
 DEBUG_FILE = "debug_cards.html"
 
-SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASS = os.environ.get("SMTP_PASS")
-TO_EMAIL = os.environ.get("TO_EMAIL", SMTP_USER)
 
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "0") == "1"
@@ -139,20 +136,27 @@ def notify(subject, body):
 
 
 def send_email(subject, body):
-    if not SMTP_USER or not SMTP_PASS:
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+    to_email = os.environ.get("TO_EMAIL", smtp_user)
+
+    if not smtp_user or not smtp_pass:
         log("SMTP_USER/SMTP_PASS not set -- skipping email, printing instead:")
         log(f"SUBJECT: {subject}\n{body}")
         return
+
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = TO_EMAIL
+    msg["From"] = smtp_user
+    msg["To"] = to_email
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, [TO_EMAIL], msg.as_string())
-        log(f"Email sent to {TO_EMAIL}: {subject}")
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, [to_email], msg.as_string())
+        log(f"Email sent to {to_email}: {subject}")
     except Exception as e:
         log(f"FAILED to send email: {e}")
 
@@ -175,16 +179,39 @@ def save_state(state):
             f.write(f"{k}={v}\n")
 
 
-def find_hotel_card_text(full_text_blocks, hotel_key):
-    """
-    full_text_blocks: list of (element_text) strings, roughly one per
-    visual "card" on the page (see extraction logic in check_once).
-    Returns the block of text containing the hotel name, or None.
-    """
-    for block in full_text_blocks:
-        if hotel_key in block.lower():
-            return block
-    return None
+CARD_LOOKUP_JS = """
+(titleText) => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let node, titleEl = null;
+    const target = titleText.trim().toUpperCase();
+    while (node = walker.nextNode()) {
+        if (node.children.length === 0) {
+            const t = (node.textContent || '').trim().toUpperCase();
+            if (t === target) { titleEl = node; break; }
+        }
+    }
+    if (!titleEl) return null;
+    let el = titleEl;
+    for (let i = 0; i < 8 && el; i++) {
+        const txt = el.innerText || '';
+        // A "card" is the ancestor that also contains the price ($)
+        // and either an availability badge or a rooms-available line.
+        if (txt.includes('$') && /available/i.test(txt)) {
+            return txt;
+        }
+        el = el.parentElement;
+    }
+    return titleEl.parentElement ? titleEl.parentElement.innerText : titleEl.innerText;
+}
+"""
+
+
+def find_hotel_card_text(page, hotel_title):
+    try:
+        return page.evaluate(CARD_LOOKUP_JS, hotel_title)
+    except Exception as e:
+        log(f"JS lookup failed for '{hotel_title}': {e}")
+        return None
 
 
 def check_once(playwright):
@@ -201,21 +228,32 @@ def check_once(playwright):
     page.goto(EVENT_URL, wait_until="networkidle", timeout=60000)
 
     # Give the SPA a little extra time to finish rendering hotel cards
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(6000)
 
-    # Heuristic: grab every element that looks like a "card" (has both
-    # some text and a reasonable size) rather than relying on a class
-    # name we haven't verified. We pull all leaf-ish containers' text.
-    # This is intentionally broad -- refine with DEBUG=1 output.
-    candidates = page.locator("div, li, article").all()
-    blocks = []
-    for el in candidates:
-        try:
-            txt = el.inner_text(timeout=500).strip()
-        except Exception:
-            continue
-        if txt and 15 < len(txt) < 600:
-            blocks.append(txt)
+    # The hotel list may be a scrollable/virtualized grid -- scroll down
+    # a few times so all cards (including ones further down, like a
+    # "Hilton Anaheim" that sorts after several "A..." hotels) get
+    # rendered into the DOM before we search it.
+    for _ in range(6):
+        page.mouse.wheel(0, 1500)
+        page.wait_for_timeout(500)
+    page.wait_for_timeout(1000)
+
+    body_text = page.inner_text("body") if page.locator("body").count() else ""
+
+    # Always write a lightweight debug summary (safe to commit, small).
+    with open("debug_summary.txt", "w") as f:
+        f.write(f"Checked at: {datetime.now().isoformat()}\n")
+        f.write(f"Page title: {page.title()}\n")
+        f.write(f"'anaheim' appears in body text: {'anaheim' in body_text.lower()}\n")
+        f.write(f"'hilton' appears in body text: {'hilton' in body_text.lower()}\n")
+        f.write(f"'marriott' appears in body text: {'marriott' in body_text.lower()}\n")
+        f.write(f"'unavailable' appears in body text: {'unavailable' in body_text.lower()}\n")
+        for hotel in WATCHED_HOTELS:
+            card = find_hotel_card_text(page, hotel)
+            f.write(f"\n--- Card lookup for '{hotel}' ---\n")
+            f.write(repr(card)[:500] if card else "NOT FOUND")
+            f.write("\n")
 
     if DEBUG:
         with open(DEBUG_FILE, "w") as f:
@@ -224,10 +262,9 @@ def check_once(playwright):
 
     results = {}
     for hotel in WATCHED_HOTELS:
-        card_text = find_hotel_card_text(blocks, hotel)
+        card_text = find_hotel_card_text(page, hotel)
         if card_text is None:
-            log(f"WARNING: could not find any card mentioning '{hotel}'. "
-                f"Page structure may differ from expected -- check {DEBUG_FILE}.")
+            log(f"WARNING: could not find card for '{hotel}'. Check debug_summary.txt.")
             results[hotel] = "not_found"
             continue
         lower = card_text.lower()
