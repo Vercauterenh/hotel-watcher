@@ -1,2 +1,4 @@
 hilton anaheim=not_found
 anaheim marriott=not_found
+Hilton Anaheim=not_found
+Anaheim Marriott Hotel=not_found
